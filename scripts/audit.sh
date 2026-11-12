@@ -42,5 +42,21 @@ if [[ -n "$(find /var/www/devops-site -perm -o+w)" ]] || [[ "$(sudo stat -c '%a'
 fi
 check "В каталоге ресурса нет файлов o+w и права ключа 600" "ok" "$sec_actual"
 
+echo "[5] Контейнеризация"
+check "Служба docker активна" "active" "$(systemctl is-active docker 2>/dev/null)"
+check "Контейнер СУБД находится в состоянии healthy" "healthy" "$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null)"
+
+ports_actual="ok"
+if ss -tln | awk '{print $4}' | grep -E ':(5000|5432)$' | grep -v '^127\.0\.0\.1:5000$' | grep -q .; then
+    ports_actual="fail"
+elif ! ss -tln | awk '{print $4}' | grep -q '^127\.0\.0\.1:5000$'; then
+    ports_actual="fail"
+fi
+check "Порты 5000 и 5432 не прослушиваются кроме 127.0.0.1" "ok" "$ports_actual"
+
+APP_ENV="${HOME}/app/.env"
+[[ ! -f "$APP_ENV" ]] && APP_ENV="/home/devops/app/.env"
+check "Права файла ~/app/.env равны 600" "600" "$(stat -c '%a' "$APP_ENV" 2>/dev/null)"
+
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

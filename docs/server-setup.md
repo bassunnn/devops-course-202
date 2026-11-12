@@ -69,6 +69,7 @@
 2. `02-keys-configured` — создана учетная запись devops, скопирован публичный SSH-ключ, проверен вход без пароля.
 3. `03-ssh-hardened` — применено усиление защиты SSH (порт 2222, отключение паролей и root), настроен межсетевой экран UFW.
 4. `04-nginx-https` — установлен веб-сервер Nginx, выпущен самоподписанный TLS-сертификат, настроен HTTPS и перенаправление с HTTP.
+5. `05-docker-compose` — развёрнута контейнеризированная среда Docker и Docker Compose с приложением devops-app и СУБД PostgreSQL.
 
 ## 8. Веб-сервер
 - **Устанавливаемый пакет:** `nginx` (версия 1.28.3 из стандартного репозитория Ubuntu).
@@ -96,3 +97,25 @@
   - Перенаправление HTTP -> HTTPS: код `301 Moved Permanently` через директиву `return 301 https://$host$request_uri;`
   - Пользовательская страница ошибки: `error_page 404 /404.html;`
   - Журналы: `/var/log/nginx/devops-site.access.log` и `/var/log/nginx/devops-site.error.log`.
+
+## 9. Контейнеризация
+- **Способ установки Docker Engine и его версия:** установка выполнена из официального репозитория Docker (`https://download.docker.com/linux/ubuntu`) с подключением официального GPG-ключа `/etc/apt/keyrings/docker.asc` (версия Docker Engine: `29.9.3`, плагин Compose: `v5.7.1`). Пакет `docker.io` из репозиториев дистрибутива не использовался.
+- **Участники группы docker:** пользователь `devops` включён в группу `docker` (`sudo usermod -aG docker devops`), что позволяет запускать контейнеры и управлять Docker Compose без повышения привилегий через `sudo`.
+- **Расположение проекта на сервере:** `/home/devops/app` (`~/app`).
+- **Расположение файла .env и его права:** `/home/devops/app/.env`, права доступа `600` (`-rw-------`, владелец `devops:devops`), содержит конфигурационные секреты приложения и базы данных, включая сгенерированный случайный пароль СУБД (`POSTGRES_PASSWORD`). Файл исключён из системы контроля версий Git с помощью `.gitignore` и из контекста сборки Docker через `.dockerignore`. Для шаблонизации подготовлен файл `app/.env.example`.
+- **Публикуемые порты и адреса:**
+  - Приложение `app` (Flask + Gunicorn): опубликован исключительно на адресе `127.0.0.1:5000:5000` (привязка строго к loopback-интерфейсу хоста исключает прямой сетевой доступ извне в обход правил межсетевого экрана UFW).
+  - СУБД `db` (PostgreSQL 16 Alpine): порт `5432` во внешнюю сеть и на хост не публикуется; взаимодействие осуществляется строго внутри изолированной пользовательской bridge-сети Compose `app_backend` по DNS-имени `db`.
+- **Именованные тома:** именованный том `app_db_data` (в `docker-compose.yml`: `db_data`), смонтированный в каталог контейнера `/var/lib/postgresql/data` для обеспечения персистентности данных СУБД при перезапусках и пересоздании контейнеров (`docker compose down`).
+- **Конфигурация обратного прокси-сервера:** в конфигурации виртуального хоста Nginx `/etc/nginx/sites-available/devops-site` в блоке `server` (порт 443 SSL) настроено проксирование пути `/app/` на локальный порт контейнера:
+  ```nginx
+  location /app/ {
+      proxy_pass http://127.0.0.1:5000/;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  ```
+  Завершающий слэш в URL директивы `proxy_pass http://127.0.0.1:5000/;` заменяет префикс `/app/` на `/`, передавая запросы вида `/app/health` приложению как `/health`. При остановленном контейнере Nginx возвращает код `502 Bad Gateway`, фиксируя ошибку подключения `connect() failed (111: Connection refused)` в журнале `/var/log/nginx/devops-site.error.log`.
+
