@@ -1,0 +1,6 @@
+---
+app_image: "ghcr.io/bassunnn/devops-ci-app"
+app_tag: "e4d55bac97f4b48accbb36a8666e582620d775d8"
+app_container_name: "devops-ci-app"
+app_host_port: 5000
+app_internal_port: 5000
