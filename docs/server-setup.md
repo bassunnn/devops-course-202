@@ -96,3 +96,127 @@
   - Перенаправление HTTP -> HTTPS: код `301 Moved Permanently` через директиву `return 301 https://$host$request_uri;`
   - Пользовательская страница ошибки: `error_page 404 /404.html;`
   - Журналы: `/var/log/nginx/devops-site.access.log` и `/var/log/nginx/devops-site.error.log`.
+
+## 10. Ansible
+
+### 10.1. Расположение и структура файлов конфигурации
+Все плейбуки, инвентари и роли Ansible сосредоточены в каталоге `ansible/`:
+- `ansible/ansible.cfg` — конфигурация исполнения (отключение Host Key Checking при строгом контроле, `pipelining = True`, `force_handlers = True` для гарантированного исполнения обработчиков при сбоях, путь к инвентарю по умолчанию `inventory/prod.ini`).
+- `ansible/requirements.yml` — зависимости от внешних коллекций (`ansible.posix`, `community.docker`, `community.general`).
+- `ansible/inventory/bootstrap.ini` — инвентарь первичного наката от имени пользователя `student` с использованием приватного SSH-ключа `~/.ssh/devops_vm`.
+- `ansible/inventory/prod.ini` — штатный инвентарь для управления от имени пользователя `devops` без использования паролей (`sudo NOPASSWD`).
+- `ansible/group_vars/all.yml` — централизованные переменные деплоя приложения.
+- `ansible/site.yml` — главный управляющий плейбук настройки узла и развёртывания стека сервисов.
+- `ansible/verify.yml` — независимый аудит-плейбук только для чтения (read-only verification).
+
+### 10.2. Архитектурная схема ролей
+Плейбук разделен на четыре строго демаркированные роли, исполняемые последовательно:
+
+```text
+[ Control Node (WSL Ubuntu) ]
+              │
+              ▼ SSH (Key auth: devops_vm)
+┌─────────────────────────────────────────────────────────┐
+│                      Managed Node                       │
+│  devops-vm (Host-only: 192.168.56.104, NAT: 127.0.0.1)   │
+│                                                         │
+│  1. Role 'base'                                         │
+│     ├── Проверка платформы (Ubuntu >= 24.04 amd64)      │
+│     ├── Базовые утилиты (curl, ufw, python3-requests)   │
+│     └── Docker CE из официального репозитория (deb822)  │
+│                                                         │
+│  2. Role 'ssh'                                          │
+│     ├── Создание пользователя devops (группы docker/sudo)│
+│     ├── Установка SSH-ключа и NOPASSWD в sudoers.d/devops│
+│     ├── Харденинг sshd (/etc/ssh/sshd_config.d/)        │
+│     │   (PasswordAuth no, PermitRootLogin no)           │
+│     └── UFW (default deny in, allow 22, 80/tcp)         │
+│                                                         │
+│  3. Role 'nginx'                                        │
+│     ├── Установка Nginx                                 │
+│     ├── Конфигурация Reverse Proxy на 127.0.0.1:5000    │
+│     ├── Отключение дефолтного сайта (default)           │
+│     └── Handler: nginx -t -> systemctl reload nginx     │
+│                                                         │
+│  4. Role 'app'                                          │
+│     ├── Pull проверенного контейнера по точному SHA     │
+│     ├── Запуск devops-ci-app (127.0.0.1:5000:5000)      │
+│     └── Health-check (uri http://127.0.0.1:5000/health) │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 10.3. Перечень переменных `group_vars/all.yml`
+```yaml
+---
+app_image: "ghcr.io/bassunnn/devops-ci-app"
+app_tag: "e4d55bac97f4b48accbb36a8666e582620d775d8"
+app_container_name: "devops-ci-app"
+app_host_port: 5000
+app_internal_port: 5000
+```
+- `app_image`: имя опубликованного Docker-образа в реестре GitHub Container Registry (GHCR).
+- `app_tag`: полный неизменяемый SHA коммита, на базе которого собран и протестирован образ в CI.
+- `app_container_name`: уникальное имя исполняемого контейнера.
+- `app_host_port`: порт локального интерфейса хоста (строго `127.0.0.1:5000`), на который проксирует Nginx.
+- `app_internal_port`: внутренний порт веб-сервера Gunicorn внутри контейнера (5000).
+
+### 10.4. Команды запуска
+
+#### Первичная настройка (Bootstrap):
+Выполняется один раз на чистой виртуальной машине:
+```bash
+ansible-playbook -i inventory/bootstrap.ini site.yml
+```
+
+#### Штатный деплой и управление конфигурацией (Prod):
+Все последующие запуски выполняются с дефолтным инвентарём от имени учетной записи `devops`:
+```bash
+ansible-playbook site.yml
+```
+
+#### Независимый аудит состояния (Verify):
+```bash
+ansible-playbook verify.yml
+```
+
+### 10.5. Сценарий восстановления после аварии (Disaster Recovery & Drift Management)
+В случае ручного изменения конфигурации узла (дрейф конфигурации) либо аварийной остановки контейнера:
+1. Запуск `ansible-playbook verify.yml` обнаруживает сбой и завершается с кодом ошибки, точно указывая на нарушенное условие (например, остановку контейнера или дрейф портов).
+2. Запуск `ansible-playbook site.yml` без дополнительных ручных манипуляций приводит состояние управляемого узла в строго декларативное состояние:
+   - восстанавливает удаленный или остановленный контейнер;
+   - обновляет файл конфигурации виртуального хоста `/etc/nginx/sites-available/devops-ci-app`;
+   - валидирует синтаксис Nginx (`nginx -t`) и мягко перезагружает веб-сервер (`systemctl reload nginx`) через зарегистрированный handler;
+   - проверяет эндпоинт `/health` до возвращения HTTP 200 OK.
+
+### 10.6. Результаты проверки идемпотентности
+При повторном запуске плейбука `site.yml` на уже сконфигурированной системе не изменяется ни один параметр, а обработчики перезагрузки служб не вызываются:
+```text
+PLAY RECAP *********************************************************************
+devops-vm                  : ok=24   changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+### 10.7. Журналы прогонов плейбука
+
+#### Итоги первичного наката (Bootstrap):
+```text
+PLAY RECAP *********************************************************************
+devops-vm                  : ok=26   changed=17   unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+#### Итоги повторного наката (Идемпотентный прогон):
+```text
+PLAY RECAP *********************************************************************
+devops-vm                  : ok=24   changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+#### Итоги восстановления дрейфа (Incident 1 — Drift Fix):
+```text
+PLAY RECAP *********************************************************************
+devops-vm                  : ok=26   changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+#### Итоги аудита (Verify):
+```text
+PLAY RECAP *********************************************************************
+devops-vm                  : ok=7    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
